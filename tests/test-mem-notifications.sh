@@ -44,10 +44,21 @@ EOF
 cat > "$T/bin/detacher" <<'EOF'
 #!/bin/zsh
 sleep 0.25
-/usr/bin/perl "$@"
+if [[ -n "${MOCK_SYSTEM_STATUS:-}" ]]; then
+ /usr/bin/perl -I "$MOCK_DIR" -MWaitStatusFixture "$@"
+else
+ /usr/bin/perl "$@"
+fi
 rc=$?
 print ready >> "$MOCK_DIR/detacher-returned"
 exit $rc
+EOF
+cat > "$T/WaitStatusFixture.pm" <<'EOF'
+package WaitStatusFixture;
+# Substitute only the external system() wait result; production decoder runs unchanged.
+# No process receives a signal to manufacture this failure case.
+BEGIN { *CORE::GLOBAL::system = sub (&@) { $? = int($ENV{MOCK_SYSTEM_STATUS}); return $?; }; }
+1;
 EOF
 chmod +x "$T/bin/"*
 pass=0; fail=0
@@ -136,11 +147,18 @@ export MEM_DETACH_COMMAND_OVERRIDE="$T/bin/detacher"
 readings 1 20971520 0M; tick
 expect 'detachment startup completes before tick returns' "$(count "$T/detacher-returned")" 1
 await_done 9
+# Perl wait status 15 means signal 15, not successful exit 0. Exercise the real decoder
+# with a synthetic OS boundary result; do not terminate a real notifier for this test.
+export MOCK_SYSTEM_STATUS=15
+readings 4 20971520 0M; tick
+for i in {1..100}; do grep -q 'NOTIFY-ERROR signal=15' "$T/log" && break; sleep 0.02; done
+grep -q 'NOTIFY-ERROR signal=15' "$T/log" && ok 'signal termination is not reported as exit zero' || no 'signal termination is not reported as exit zero' "$(grep 'NOTIFY-ERROR' "$T/log" | tail -1)"
+unset MOCK_SYSTEM_STATUS
 unset MEM_DETACH_COMMAND_OVERRIDE
 parent_group=$(/usr/bin/perl -e 'print getpgrp()')
 worker_group=$(head -1 "$T/groups")
 [[ "$worker_group" == <-> && "$parent_group" != "$worker_group" ]] && ok 'notifier detached from caller process group' || no 'notifier detached from caller process group'
-expect 'one process snapshot per tick' "$(count "$T/scans")" 17
+expect 'one process snapshot per tick' "$(count "$T/scans")" 18
 expect 'no tick stderr errors' "$(count "$T/errors")" 0
 expect 'observe-only never attempts a process signal' "$(count "$T/signals")" 0
 print "RESULT: $pass passed, $fail failed"

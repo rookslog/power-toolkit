@@ -121,7 +121,9 @@ if printf 'pressure\t%s\ndisk\t%s\nswap\t%s\n' "$previous[pressure]" "$previous[
       exit 0 if $pid;  # zsh waits only for this detached dispatcher, never delivery
       system {$cmd[0]} @cmd;
       my $rc=$?;
-      print "$ts NOTIFY-ERROR exit=".($rc == -1 ? 127 : $rc >> 8)."\n" if $rc != 0;
+      if ($rc == -1) { print "$ts NOTIFY-ERROR spawn\n" }
+      elsif ($rc & 127) { print "$ts NOTIFY-ERROR signal=".($rc & 127)."\n" }
+      elsif ($rc >> 8) { print "$ts NOTIFY-ERROR exit=".($rc >> 8)."\n" }
     ' "$NOTIFY_LOCK" "$(ts)" "${MEM_NOTIFY_COMMAND_OVERRIDE:-/usr/bin/osascript}" \
       -e 'on run argv
         display notification (item 2 of argv) with title (item 1 of argv)
