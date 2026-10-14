@@ -1,6 +1,8 @@
 #!/bin/zsh
 emulate -L zsh
 set -u
+setopt PIPE_FAIL
+unsetopt BG_NICE                 # avoid implicit nice(5) on the detached delivery worker
 # Adaptive, pressure-aware memory guardian over ALL processes (the rg-to-17GB swap-exhaustion
 # failure mode). Decides intervention by a HEADROOM-AWARE risk score + profile class, never a
 # flat absolute RSS ceiling. Reads everything from config.sh.
@@ -9,7 +11,8 @@ set -u
 # and — for each notable process — the risk score, profile, and the action it WOULD take. The
 # kill code path is introduced in M1, after observe evidence shows the scores are sane.
 #
-# Steady-state cost: exactly one `ps` (the per-process scan) + a few O(1) sysctls per tick.
+# System threshold notifications do not change that per-process decision ladder.
+# Steady-state cost: one `ps`, a few O(1) sysctls and one Data-volume `df` per tick.
 
 PT_ROOT=${0:A:h:h}; source "$PT_ROOT/config.sh"
 zmodload zsh/datetime 2>/dev/null
@@ -19,6 +22,8 @@ mkdir -p "$PT_LOG"
 LOG="${MEM_LOG_OVERRIDE:-$PT_LOG/mem-watchdog.log}"
 STATE="${MEM_STATE_OVERRIDE:-$PT_VAR/mem-state.tsv}"   # pid \t rss_kb \t first_seen \t last_seen \t streak \t start
 SWAPLAST="${MEM_SWAPLAST_OVERRIDE:-$PT_VAR/mem-swap-last}"   # last swap-used (MB), for the growth delta
+ALERT_STATE="${MEM_ALERT_STATE_OVERRIDE:-$PT_VAR/mem-alert-state.tsv}"
+NOTIFY_LOCK="${MEM_NOTIFY_LOCK_OVERRIDE:-$PT_VAR/mem-notify.lock}"
 pt_rotate_log "$LOG"     # bound the observe history; see PT_LOG_MAX_KB in config.sh
 
 ts() { strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS; }
@@ -30,16 +35,30 @@ ts() { strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS; }
 # availability explicitly instead, band only on the signals we actually have, and put the
 # degradation in the log where it can be seen.
 degraded=""
-press=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
-free_pct=$(sysctl -n kern.memorystatus_level 2>/dev/null)
-swap_used=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used"){v=$(i+2); gsub(/M/,"",v); print int(v); exit}}')
-[[ "$press"    == <-> ]] || { degraded="${degraded}pressure "; press=""; }
+press=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) || press=""
+free_pct=$(sysctl -n kern.memorystatus_level 2>/dev/null) || free_pct=""
+swap_bytes=$(LC_ALL=C sysctl -n vm.swapusage 2>/dev/null | awk '
+  { for(i=1;i<=NF;i++) if($i=="used" && $(i+1)=="=") {
+      v=$(i+2); if(v !~ /^[0-9]+(\.[0-9]+)?[KMGT]?B?$/) exit
+      unit=v; gsub(/[0-9.B]/,"",unit); sub(/[KMGT]?B?$/,"",v)
+      scale=(unit=="K"?1024:unit=="M"?1048576:unit=="G"?1073741824:unit=="T"?1099511627776:1)
+      printf "%.0f\n",v*scale; exit
+  } }') || swap_bytes=""
+data_free_bytes=$(LC_ALL=C df -Pk "$MEM_DATA_VOLUME" 2>/dev/null | awk '
+  NR==2 && $4 ~ /^[0-9]+$/ { printf "%.0f\n", $4*1024 }') || data_free_bytes=""
+[[ "$press" == 1 || "$press" == 2 || "$press" == 4 ]] || { degraded="${degraded}pressure "; press=""; }
 [[ "$free_pct" == <-> ]] || { degraded="${degraded}free-pct "; free_pct=""; }
-[[ "$swap_used" == <-> ]] || { degraded="${degraded}swap "; swap_used=0; }
+[[ "$swap_bytes" == <-> ]] || { degraded="${degraded}swap "; swap_bytes=""; }
+[[ "$data_free_bytes" == <-> ]] || { degraded="${degraded}disk "; data_free_bytes=""; }
 
-prev_swap=$(cat "$SWAPLAST" 2>/dev/null || print "$swap_used")
-swap_delta=$(( swap_used - prev_swap ))
-print -- "$swap_used" > "$SWAPLAST"
+swap_used=""; swap_delta="?"
+if [[ -n "$swap_bytes" ]]; then
+  swap_used=$(( swap_bytes / 1048576 ))
+  prev_swap=$(cat "$SWAPLAST" 2>/dev/null)
+  [[ "$prev_swap" == <-> ]] || prev_swap=$swap_used
+  printf -v swap_delta '%+d' $(( swap_used - prev_swap ))
+  print -- "$swap_used" > "$SWAPLAST"
+fi
 
 rank() { case "$1" in critical) print 3;; caution) print 2;; unknown) print 1;; *) print 0;; esac }
 # free-% band — `unknown` when the signal is unavailable, never `healthy`
@@ -53,7 +72,62 @@ else case "$press" in 4) pband=critical;; 2) pband=caution;; *) pband=healthy;; 
 # headroom_state = worse of the two. `unknown` outranks `healthy`, so a machine we cannot see
 # never reports as fine; it does NOT outrank a real caution/critical read from the other signal.
 if (( $(rank $pband) > $(rank $band) )); then headroom=$pband; else headroom=$band; fi
-[[ -n "$degraded" ]] && print -- "$(ts) DEGRADED  headroom signals unavailable: ${degraded%% } — reporting headroom=$headroom, not healthy" >> "$LOG"
+[[ -n "$degraded" ]] && print -- "$(ts) DEGRADED unavailable=${degraded%% } headroom=$headroom; unknown readings shown as ?" >> "$LOG"
+
+# ---------- persistent system edges (unknown never invents a recovery) ----------
+# launchd invokes a fresh process each tick, so in-memory state alone would repeat alerts.
+typeset -A previous=(pressure normal disk normal swap normal)
+if [[ -f "$ALERT_STATE" ]]; then
+  while IFS=$'\t' read -r key value; do
+    case "$key:$value" in
+      pressure:normal|pressure:critical|disk:normal|disk:low|swap:normal|swap:high) previous[$key]=$value;;
+    esac
+  done < "$ALERT_STATE"
+fi
+typeset -a edges=()
+edge() {
+  local key=$1 value=$2
+  [[ -n "$value" ]] || return 0
+  if [[ "$value" != "${previous[$key]}" ]]; then
+    local event="$key:$value"
+    [[ "$value" == normal ]] && event="$key:recovered"
+    edges+=("$event")
+    print -- "$(ts) EVENT $event" >> "$LOG"
+  fi
+  previous[$key]=$value
+}
+pressure_alert=""; disk_alert=""; swap_alert=""
+[[ -n "$press" ]] && { if (( press & 4 )); then pressure_alert=critical; else pressure_alert=normal; fi; }
+[[ -n "$data_free_bytes" ]] && { if (( data_free_bytes < MEM_DISK_LOW_BYTES )); then disk_alert=low; else disk_alert=normal; fi; }
+[[ -n "$swap_bytes" ]] && { if (( swap_bytes > MEM_SWAP_HIGH_BYTES )); then swap_alert=high; else swap_alert=normal; fi; }
+edge pressure "$pressure_alert"; edge disk "$disk_alert"; edge swap "$swap_alert"
+
+# Persist before attempting delivery: even a failed notifier must not page every tick.
+if printf 'pressure\t%s\ndisk\t%s\nswap\t%s\n' "$previous[pressure]" "$previous[disk]" "$previous[swap]" \
+     > "$ALERT_STATE.tmp" && mv "$ALERT_STATE.tmp" "$ALERT_STATE"; then
+  if (( MEM_NOTIFY_ENABLE && ${#edges} )); then
+    body="${(j:; :)edges}; available disk=${data_free_bytes:-?} bytes; swap=${swap_bytes:-?} bytes"
+    # Non-interactive zsh backgrounding alone stays in the launchd job's process group;
+    # launchd normally cleans that group up at exit. setsid detaches the delivery worker.
+    # flock is released by the OS on exit: no stale PID marker and no process signals.
+    # A stuck notifier holds one lock/worker, never blocks sampling or accumulates workers.
+    # Edges skipped while it is busy remain in EVENT history; delivery is best-effort.
+    /usr/bin/perl -MPOSIX=setsid -MFcntl=:flock -e '
+      my ($lockfile,$ts,@cmd)=@ARGV;
+      setsid() != -1 or do { print "$ts NOTIFY-ERROR detach\n"; exit 1 };
+      open(my $lock,">>",$lockfile) or do { print "$ts NOTIFY-ERROR lock-open\n"; exit 1 };
+      flock($lock,LOCK_EX|LOCK_NB) or do { print "$ts NOTIFY-SKIPPED worker-busy\n"; exit 0 };
+      system {$cmd[0]} @cmd;
+      my $rc=$?;
+      print "$ts NOTIFY-ERROR exit=".($rc == -1 ? 127 : $rc >> 8)."\n" if $rc != 0;
+    ' "$NOTIFY_LOCK" "$(ts)" "${MEM_NOTIFY_COMMAND_OVERRIDE:-/usr/bin/osascript}" \
+      -e 'on run argv
+        display notification (item 2 of argv) with title (item 1 of argv)
+      end run' 'Memory watchdog' "$body" </dev/null >> "$LOG" 2>/dev/null &!
+  fi
+else
+  print -- "$(ts) NOTIFY-ERROR state-write; no delivery attempted" >> "$LOG"
+fi
 
 # Test-only injection (unset in production / launchd): force a headroom state and/or feed
 # synthetic process rows from a file, so the would-action ladder + kill-safety list can be
@@ -74,7 +148,8 @@ press_disp=${press:-?}; free_disp=${free_pct:-?}
 "${ps_cmd[@]}" | awk \
   -v NOW="$NOW" -v TS="$(ts)" -v STATEIN="$STATE" -v STATEOUT="$STATE.tmp" \
   -v HEADROOM="$headroom" -v PRESS="$press_disp" -v FREEPCT="$free_disp" \
-  -v SWAP="$swap_used" -v SWAPD="$swap_delta" -v TOPN="$MEM_TOP_N" \
+  -v SWAP="${swap_used:-?}" -v SWAPD="$swap_delta" -v SWAPBYTES="${swap_bytes:-?}" \
+  -v DATAFREE="${data_free_bytes:-?}" -v TOPN="$MEM_TOP_N" \
   -v W_SIZE="$MEM_W_SIZE" -v W_GROWTH="$MEM_W_GROWTH" -v W_PROFILE="$MEM_W_PROFILE" -v W_FG="$MEM_W_FOREGROUND" \
   -v GROWTH_REF="$MEM_GROWTH_REF_MBPS" -v R_WATCH="$MEM_RISK_WATCH" -v R_NOTIFY="$MEM_RISK_NOTIFY" -v R_KILL="$MEM_RISK_KILL" \
   -v GROWTH_MIN="$MEM_GROWTH_MIN_MBPS" -v SUSTAIN="$MEM_SUSTAIN_TICKS" -v RATIO_HARD="$MEM_RATIO_HARD" \
@@ -199,8 +274,8 @@ press_disp=${press:-?}; free_disp=${free_pct:-?}
   }
   END {
     close(STATEOUT)
-    printf "%s TICK headroom=%s press=%s free=%s%% swap=%sM(d%+d) procs=%d top=%s:%.2f\n", \
-      TS, HEADROOM, PRESS, FREEPCT, SWAP, SWAPD, nproc, maxcomm, (maxrisk<0?0:maxrisk)
+    printf "%s TICK headroom=%s press=%s free=%s%% swap=%sM(d%s) swap_bytes=%s data_free_bytes=%s procs=%d top=%s:%.2f\n", \
+      TS, HEADROOM, PRESS, FREEPCT, SWAP, SWAPD, SWAPBYTES, DATAFREE, nproc, maxcomm, (maxrisk<0?0:maxrisk)
     # print up to TOPN flagged, highest risk first (BSD awk has no asort -> manual selection)
     printed=0
     while (printed < TOPN && printed < nflag) {

@@ -14,3 +14,5 @@ jobs:
             echo "checking $f"
             zsh -n "$f"
           done
+      - name: deterministic memory notification contracts
+        run: zsh tests/test-mem-notifications.sh
