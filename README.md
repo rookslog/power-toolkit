@@ -29,7 +29,7 @@ A stuck `pyenv` shim pegged a CPU core at 99% for ~44 hours and silently drained
 ## Features
 
 - **CPU watchdog** — notifies (optionally kills, off by default) any non-system process that pegs a CPU core *continuously* past a threshold (default 85% for ~15 min). Brief bursty spikes and known-heavy system daemons (Spotlight, `mediaanalysisd`, backup, etc.) are deliberately excluded so it does not false-alarm.
-- **Memory guardian** *(observe mode)* — watches *every* process for runaway memory growth (the swap-exhaustion failure mode where one process balloons to many GB and fills swap) using a **headroom-aware risk score** and per-process **profiles** (system / trusted-app / dev-runtime / ephemeral / unknown) rather than a flat RSS ceiling. A sustained-growth gate means a transient burst (a browser loading a page) is not mistaken for a runaway. Steady-state cost is one `ps` per tick (~0.06 s CPU / 3 MB). It currently runs **observe-only** — logging the action it *would* take — with notify / auto-kill (opt-in per profile, ephemeral-only, *never* system or VM processes) as the next step.
+- **Memory guardian** *(process-observe mode)* — watches *every* process for runaway memory growth using a **headroom-aware risk score** and per-process **profiles** (system / trusted-app / dev-runtime / ephemeral / unknown). A sustained-growth gate avoids treating a transient burst as a runaway. Per-process actions remain **observe-only**: it logs what it *would* do and never signals a process. Independently, it logs Data-volume available bytes and sends best-effort asynchronous system notifications on entry/recovery for critical kernel pressure, disk below 10 GiB, and swap above 8 GB. Steady-state sampling is one `ps`, constant-size sysctl reads and one `df -k`, never a directory walk.
 - **Bluetooth-on-sleep saver** — turns Bluetooth OFF only after the lid has been shut for a while (default 30 min), so quick "walking to another room" closures keep Bluetooth on. Restores Bluetooth instantly on lid-open. Battery-only by default.
 - **pmset reconciler** — keeps macOS power settings matching a declared desired state; e.g. `tcpkeepalive` and `powernap` OFF on battery, ON when plugged in. `pm status` shows any drift; `pm apply` corrects it.
 
@@ -117,6 +117,36 @@ export PATH="$HOME/bin:$PATH"
 ## Configuration
 
 All behavior is controlled by `config.sh` at the repo root — thresholds, allowlists, memory risk weights / profiles, Bluetooth timing, pmset desired state, and the active mode. Every component (the `pm` CLI, the CPU watchdog, the memory guardian, the saver, the sleep/wake hooks) sources this file at runtime.
+
+### Memory system notifications
+
+TICK includes `data_free_bytes` (user-available space on `/System/Volumes/Data`)
+and `swap_bytes`. Disk is low strictly below **10 GiB** (10 × 1024³ bytes); swap is
+high strictly above **8 GB** (8,000,000,000 bytes). Kernel pressure 4 enters
+critical; 1 or 2 recovers. The thresholds and volume path live in `config.sh`.
+Missing/failed readings are `?`, not zero, and cannot invent a recovery.
+
+System states persist between launchd invocations in `var/mem-alert-state.tsv`.
+Each change is logged as `EVENT pressure:critical`, `disk:low`, `swap:high`, or
+`<signal>:recovered`; simultaneous edges are batched into one notification.
+Unchanged conditions are never re-notified, including after delivery failure.
+Deleting the state file re-arms initial active conditions. `MEM_NOTIFY_ENABLE=0`
+disables delivery, not sampling or event history.
+
+Delivery uses macOS `/usr/bin/perl` (POSIX setsid + nonblocking flock) to detach
+before forking the delivery worker, avoiding a startup race with launchd's
+process-group cleanup. Delivery is bounded to one worker. A slow
+`osascript` cannot block a tick or accumulate workers. While it is busy, additional
+edges stay in EVENT history and delivery is skipped with `NOTIFY-SKIPPED worker-busy`;
+failures are `NOTIFY-ERROR`. No process is signaled to clear a stuck notifier.
+Notification Center permissions/Focus settings can still hide delivery; an event
+log is not proof a human saw a notification. Thresholds do not affect process
+kill eligibility, and the M0 script contains no kill path.
+
+Run `zsh tests/test-mem-notifications.sh` for synthetic readings, persistent
+crossings/recovery, unknown/failing inputs, units/boundaries, nonblocking bounded
+delivery, detached process groups, and the no-signals contract. Fixtures never
+touch live state or invoke Notification Center. CI runs this test on macOS.
 
 **Workflow:** edit `config.sh`, then run `pm apply`.
 

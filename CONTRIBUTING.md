@@ -27,6 +27,10 @@ Issues and PRs are welcome. No CLA required — this is a small, personal-scale 
 
 Both checks must be clean before the PR is opened. The CI workflow (`lint.yml`) enforces the `zsh -n` gate automatically.
 
+3. Run `zsh tests/test-mem-notifications.sh`. This deterministic suite uses isolated
+   state and synthetic system commands/notifier, never real load or notifications.
+   CI also runs it. Do not use a real-load stress test as a routine pre-PR check.
+
 ## Note on shellcheck
 
 shellcheck is **not used** in this project. shellcheck targets POSIX sh/bash and produces false positives on valid zsh syntax. `zsh -n` is the syntax gate here.

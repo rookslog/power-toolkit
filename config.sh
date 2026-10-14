@@ -58,10 +58,15 @@ AGG_ALLOWLIST_PCT=60             # if at least this %% of the summed load is ALE
 # ---------- memory guardian (mem-watchdog) ----------
 # Adaptive, pressure-aware RSS watchdog over ALL processes (the rg-to-17GB swap-exhaustion
 # failure mode). Risk model + profiles: see goal/GOAL_CONTRACT.md §3.
-# M0 ships OBSERVE-ONLY: logs per-tick headroom + risk + the action it WOULD take; never kills.
+# M0 remains OBSERVE-ONLY for processes: logs risk/would-actions; never signals a process.
+# System threshold notifications are independent of the per-process decision ladder.
 MEM_WATCHDOG_INTERVAL_SEC=60     # base poll cadence (one `ps` per tick when healthy)
-MEM_OBSERVE=1                    # 1 = observe/log-only (M0). Kill code path is not present until M1.
+MEM_OBSERVE=1                    # per-process observe-only (M0); no signal code path exists.
 MEM_TOP_N=5                      # per tick, log this many highest-risk processes
+MEM_DATA_VOLUME="/System/Volumes/Data"  # one O(1) df -k lookup, never a directory walk
+MEM_DISK_LOW_BYTES=$(( 10 * 1024 * 1024 * 1024 ))  # below 10 GiB available to the user
+MEM_SWAP_HIGH_BYTES=8000000000    # above 8 GB (decimal); separate from risk/kill eligibility
+MEM_NOTIFY_ENABLE=1              # edge-triggered system alerts + recoveries, best-effort async
 
 # Headroom gate — danger is HEADROOM-AWARE, never a flat per-process RSS ceiling.
 # Primary signal is the kernel's own verdict + free-memory %, NOT absolute swap (this machine
