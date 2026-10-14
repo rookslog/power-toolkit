@@ -2,7 +2,6 @@
 emulate -L zsh
 set -u
 setopt PIPE_FAIL
-unsetopt BG_NICE                 # avoid implicit nice(5) on the detached delivery worker
 # Adaptive, pressure-aware memory guardian over ALL processes (the rg-to-17GB swap-exhaustion
 # failure mode). Decides intervention by a HEADROOM-AWARE risk score + profile class, never a
 # flat absolute RSS ceiling. Reads everything from config.sh.
@@ -107,23 +106,27 @@ if printf 'pressure\t%s\ndisk\t%s\nswap\t%s\n' "$previous[pressure]" "$previous[
      > "$ALERT_STATE.tmp" && mv "$ALERT_STATE.tmp" "$ALERT_STATE"; then
   if (( MEM_NOTIFY_ENABLE && ${#edges} )); then
     body="${(j:; :)edges}; available disk=${data_free_bytes:-?} bytes; swap=${swap_bytes:-?} bytes"
-    # Non-interactive zsh backgrounding alone stays in the launchd job's process group;
-    # launchd normally cleans that group up at exit. setsid detaches the delivery worker.
+    # Complete setsid in the foreground dispatcher BEFORE it forks delivery and returns.
+    # Backgrounding the dispatcher itself races launchd's process-group cleanup at exit.
     # flock is released by the OS on exit: no stale PID marker and no process signals.
     # A stuck notifier holds one lock/worker, never blocks sampling or accumulates workers.
     # Edges skipped while it is busy remain in EVENT history; delivery is best-effort.
-    /usr/bin/perl -MPOSIX=setsid -MFcntl=:flock -e '
+    "${MEM_DETACH_COMMAND_OVERRIDE:-/usr/bin/perl}" -MPOSIX=setsid -MFcntl=:flock -e '
       my ($lockfile,$ts,@cmd)=@ARGV;
       setsid() != -1 or do { print "$ts NOTIFY-ERROR detach\n"; exit 1 };
       open(my $lock,">>",$lockfile) or do { print "$ts NOTIFY-ERROR lock-open\n"; exit 1 };
       flock($lock,LOCK_EX|LOCK_NB) or do { print "$ts NOTIFY-SKIPPED worker-busy\n"; exit 0 };
+      my $pid=fork();
+      defined($pid) or do { print "$ts NOTIFY-ERROR fork\n"; exit 1 };
+      exit 0 if $pid;  # zsh waits only for this detached dispatcher, never delivery
       system {$cmd[0]} @cmd;
       my $rc=$?;
       print "$ts NOTIFY-ERROR exit=".($rc == -1 ? 127 : $rc >> 8)."\n" if $rc != 0;
     ' "$NOTIFY_LOCK" "$(ts)" "${MEM_NOTIFY_COMMAND_OVERRIDE:-/usr/bin/osascript}" \
       -e 'on run argv
         display notification (item 2 of argv) with title (item 1 of argv)
-      end run' 'Memory watchdog' "$body" </dev/null >> "$LOG" 2>/dev/null &!
+      end run' 'Memory watchdog' "$body" </dev/null >> "$LOG" 2>/dev/null \
+      || print -- "$(ts) NOTIFY-ERROR dispatcher" >> "$LOG"
   fi
 else
   print -- "$(ts) NOTIFY-ERROR state-write; no delivery attempted" >> "$LOG"

@@ -134,7 +134,8 @@ Deleting the state file re-arms initial active conditions. `MEM_NOTIFY_ENABLE=0`
 disables delivery, not sampling or event history.
 
 Delivery uses macOS `/usr/bin/perl` (POSIX setsid + nonblocking flock) to detach
-from launchd's process-group cleanup and bound delivery to one worker. A slow
+before forking the delivery worker, avoiding a startup race with launchd's
+process-group cleanup. Delivery is bounded to one worker. A slow
 `osascript` cannot block a tick or accumulate workers. While it is busy, additional
 edges stay in EVENT history and delivery is skipped with `NOTIFY-SKIPPED worker-busy`;
 failures are `NOTIFY-ERROR`. No process is signaled to clear a stuck notifier.

@@ -41,6 +41,14 @@ sleep "${MOCK_NOTIFY_DELAY:-0}"
 print done >> "$MOCK_DIR/done"
 exit "${MOCK_NOTIFY_EXIT:-0}"
 EOF
+cat > "$T/bin/detacher" <<'EOF'
+#!/bin/zsh
+sleep 0.25
+/usr/bin/perl "$@"
+rc=$?
+print ready >> "$MOCK_DIR/detacher-returned"
+exit $rc
+EOF
 chmod +x "$T/bin/"*
 pass=0; fail=0
 ok(){ print "PASS $1"; ((pass+=1)); }
@@ -122,10 +130,17 @@ expect 'busy notifier does not accumulate workers' "$(count "$T/notices")" 8
 grep -q 'NOTIFY-SKIPPED.*busy' "$T/log" && ok 'busy delivery explicitly logged' || no 'busy delivery explicitly logged'
 await_done 8
 unset MOCK_NOTIFY_DELAY
+# A delayed dispatcher must finish detaching before the launchd parent can exit.
+# Actual Perl still performs detachment/fork; the wrapper only delays its startup.
+export MEM_DETACH_COMMAND_OVERRIDE="$T/bin/detacher"
+readings 1 20971520 0M; tick
+expect 'detachment startup completes before tick returns' "$(count "$T/detacher-returned")" 1
+await_done 9
+unset MEM_DETACH_COMMAND_OVERRIDE
 parent_group=$(/usr/bin/perl -e 'print getpgrp()')
 worker_group=$(head -1 "$T/groups")
 [[ "$worker_group" == <-> && "$parent_group" != "$worker_group" ]] && ok 'notifier detached from caller process group' || no 'notifier detached from caller process group'
-expect 'one process snapshot per tick' "$(count "$T/scans")" 16
+expect 'one process snapshot per tick' "$(count "$T/scans")" 17
 expect 'no tick stderr errors' "$(count "$T/errors")" 0
 expect 'observe-only never attempts a process signal' "$(count "$T/signals")" 0
 print "RESULT: $pass passed, $fail failed"
