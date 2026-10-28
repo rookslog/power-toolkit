@@ -363,6 +363,7 @@ def atomic_text(path, value):
 
 def settings(toolkit):
     keys = [
+        "PT_LOG",
         "STORAGE_STATE",
         "STORAGE_INTERVAL_SEC",
         "STORAGE_FAST_FALL_BYTES",
@@ -484,7 +485,6 @@ def generate_plists(directory, toolkit, config):
     base = {
         "ProcessType": "Background",
         "StandardOutPath": "/dev/null",
-        "StandardErrorPath": "/dev/null",
     }
     if int(config["STORAGE_ENABLE"]):
         mem = {
@@ -528,6 +528,7 @@ def generate_plists(directory, toolkit, config):
     stage = Path(tempfile.mkdtemp(prefix=".storage-generate-", dir=directory))
     targets = []
     for job in (mem, daily):
+        job["StandardErrorPath"] = str(Path(config["PT_LOG"]) / (job["Label"] + ".err.log"))
         name = job["Label"] + ".plist"
         target = directory / name
         staged = stage / name
@@ -695,9 +696,9 @@ def monitor(directory, toolkit, once=False, skip_memory=False):
         except BlockingIOError:
             raise RuntimeError("another storage runner owns this toolkit")
         config = config_values(toolkit)
-        cfg = settings(toolkit)
-        directory = Path(directory)
-        interval = int(cfg["STORAGE_INTERVAL_SEC"])
+        cfg = None
+        directory = Path(directory) if directory is not None else None
+        interval = 1.0  # Retry unavailable telemetry without reading storage settings here.
         recorder = None
         memory = None
         last_memory = -1e30
@@ -708,8 +709,13 @@ def monitor(directory, toolkit, once=False, skip_memory=False):
         guardian = {}
 
         def telemetry():
-            nonlocal recorder
+            nonlocal recorder, cfg, directory, interval
             try:
+                if cfg is None:
+                    cfg = settings(toolkit)
+                    interval = int(cfg["STORAGE_INTERVAL_SEC"])
+                if directory is None:
+                    directory = Path(cfg["STORAGE_STATE"]) / "monitor"
                 if recorder is None:
                     recorder = Recorder(directory, config["low"], cfg)
                 tick = time.monotonic()
@@ -747,7 +753,8 @@ def monitor(directory, toolkit, once=False, skip_memory=False):
                 }
                 print(json.dumps(failure), file=sys.stderr)
                 try:
-                    atomic(directory / "last-error.json", failure)
+                    if directory is not None:
+                        atomic(directory / "last-error.json", failure)
                 except OSError:
                     pass
 
@@ -767,7 +774,7 @@ def monitor(directory, toolkit, once=False, skip_memory=False):
                 try:
                     memory = subprocess.Popen(
                         ["/bin/zsh", "-f", str(toolkit / "libexec/mem-watchdog.sh")],
-                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        env=env, stdout=subprocess.DEVNULL,
                     )
                     guardian.update(dispatch_utc=utc(), dispatch_error=None)
                     alarm.clear()
@@ -800,6 +807,11 @@ def main():
     args = p.parse_args()
     output = args.output
     try:
+        if args.mode == "monitor":
+            # Storage settings and the default state path belong to telemetry;
+            # only the guardian's config_values() may gate monitor startup.
+            monitor(output, args.toolkit, args.once, args.skip_memory_watchdog)
+            return
         cfg = settings(args.toolkit)
         output = output or Path(cfg["STORAGE_STATE"]) / (
             "daily" if args.mode == "daily" else "monitor"
@@ -836,8 +848,6 @@ def main():
             rows, coverage = processes()
             atomic(output, {"utc": utc(), "coverage": coverage, "rows": rows})
             print(json.dumps(coverage))
-        else:
-            monitor(output, args.toolkit, args.once, args.skip_memory_watchdog)
     except Exception as error:
         if output is None:
             raise

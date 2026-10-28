@@ -23,6 +23,7 @@ TEMP.mkdir(exist_ok=True)
 
 def config(enabled='1'):
     return {
+        'PT_LOG': str(ROOT / 'var/log'),
         'STORAGE_ENABLE': enabled, 'STORAGE_INTERVAL_SEC': '1',
         'STORAGE_WINDOW_SEC': '600', 'STORAGE_INCIDENT_SLOTS': '40',
         'STORAGE_CAPTURE_COOLDOWN_SEC': '300',
