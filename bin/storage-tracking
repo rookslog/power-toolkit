@@ -1,0 +1,18 @@
+#!/bin/zsh
+# Resolve Python/config once; launchd does not inherit the interactive PATH.
+emulate -L zsh
+set -eu
+PT_ROOT=${0:A:h:h}
+source "$PT_ROOT/config.sh"
+if [[ "${1:-}" == daily ]] && (( ! STORAGE_ENABLE )); then
+  exit 0
+fi
+if [[ "${1:-}" == monitor && ! -x "$STORAGE_PYTHON" ]]; then
+  # Optional telemetry must not gate the stock guardian. A failed guardian tick
+  # is retried at the normal cadence, just as with the periodic launchd job.
+  while :; do
+    /bin/zsh -f "$PT_ROOT/libexec/mem-watchdog.sh" || true
+    sleep "$MEM_WATCHDOG_INTERVAL_SEC"
+  done
+fi
+exec "$STORAGE_PYTHON" -B "$PT_ROOT/libexec/storage_tracking.py" "$@" --toolkit "$PT_ROOT"

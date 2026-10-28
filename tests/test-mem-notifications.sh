@@ -3,7 +3,7 @@ emulate -L zsh
 set -u
 # Synthetic readings through the real watchdog. No live state, notifications or signals.
 ROOT=${0:A:h:h}
-T=$(mktemp -d /tmp/pt-notify-test.XXXXXX)
+T=$(mktemp -d "${TMPDIR:-/tmp}/pt-notify-test.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/zdot"
 export MOCK_DIR="$T" SIGNAL_LOG="$T/signals"
