@@ -1,0 +1,10 @@
+#!/bin/zsh
+# Resolve Python/config once; launchd does not inherit the interactive PATH.
+emulate -L zsh
+set -eu
+PT_ROOT=${0:A:h:h}
+source "$PT_ROOT/config.sh"
+if [[ "${1:-}" == daily ]] && (( ! STORAGE_ENABLE )); then
+  exit 0
+fi
+exec "$STORAGE_PYTHON" -B "$PT_ROOT/libexec/storage_tracking.py" "$@" --toolkit "$PT_ROOT"

@@ -10,9 +10,14 @@ jobs:
       - name: zsh -n all scripts
         run: |
           set -e
-          for f in bin/pm install.sh config.sh libexec/*; do
+          for f in bin/* install.sh config.sh libexec/*; do
+            case "$f" in *.py|*/__pycache__) continue ;; esac
             echo "checking $f"
             zsh -n "$f"
           done
       - name: deterministic memory notification contracts
         run: zsh tests/test-mem-notifications.sh
+      - name: storage tracker and fast-fall contracts
+        run: |
+          zsh tests/test-fast-fall.sh
+          PT_RUN_MAC_INTEGRATION=1 STORAGE_PYTHON="$(command -v python3)" python3 -B -m unittest discover -s tests -p 'test_storage*.py' -v

@@ -15,7 +15,7 @@ if (( EUID == 0 )) && [[ -n "${SUDO_USER:-}" ]]; then
 else
   TARGET_UID=$(id -u)
 fi
-AGENTS_DIR="$HOME/Library/LaunchAgents"
+AGENTS_DIR="${PT_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 GUI="gui/$TARGET_UID"
 BLUEUTIL=$(command -v blueutil || true)
 SLEEPWATCHER=$(command -v sleepwatcher || true)
@@ -74,7 +74,46 @@ reload_agent() {   # $1=label  $2=plistpath  (retry around launchd's async booto
   return 1
 }
 
+# The transaction library only defines functions; pm owns the native callbacks.
+source "$PT_ROOT/libexec/storage-jobs.sh"
+agent_loaded() {
+  local diagnostic rc
+  # Discard successful job output (it can include arguments/environment).
+  # Distinguish absent service from a restricted/unavailable domain query.
+  # A missing/inaccessible GUI domain must not look like an absent job.
+  LC_ALL=C launchctl print "$GUI" >/dev/null 2>&1 || return 2
+  diagnostic=$(LC_ALL=C launchctl print "$GUI/$1" 2>&1 >/dev/null)
+  rc=$?
+  (( rc == 0 )) && return 0
+  [[ "$diagnostic" == *"Could not find service"* ]] && return 1
+  print -u2 -- "cannot determine prior storage job state"
+  return 2
+}
+stop_agent() {
+  local rc
+  agent_loaded "$1"
+  rc=$?
+  (( rc == 1 )) && return 0
+  (( rc == 0 )) || return 1
+  launchctl bootout "$GUI/$1" 2>/dev/null
+}
+storage_validate() {
+  plutil -lint "$1/$MEM_WATCHDOG_LABEL.plist" "$1/$STORAGE_DAILY_LABEL.plist" >/dev/null
+}
+storage_prepare() {
+  local AGENTS_DIR=$1
+  if (( STORAGE_ENABLE )); then
+    "$PT_ROOT/bin/storage-tracking" generate-plists --output "$AGENTS_DIR" || return 1
+  else
+    gen_plist "$MEM_WATCHDOG_LABEL" "$MEM_WATCHDOG_INTERVAL_SEC" "$PT_ROOT/libexec/mem-watchdog.sh" >/dev/null || return 1
+    storage_disabled_daily "$AGENTS_DIR/$STORAGE_DAILY_LABEL.plist" || return 1
+  fi
+}
+
 cmd_apply() {
+  # Storage generation/publication/reconciliation is one recoverable operation.
+  # It finishes before unrelated pmset/CPU/saver work and propagates failure.
+  storage_apply || return 1
   print -- "Applying mode '$PT_MODE' from $PT_ROOT/config.sh"; bar
 
   # 1) pmset desired state (needs root)
@@ -112,10 +151,13 @@ cmd_apply() {
   reload_agent "$WATCHDOG_LABEL" "$p"; c_green "  agent  $WATCHDOG_LABEL (every ${WATCHDOG_INTERVAL_SEC}s)"
   p=$(gen_plist "$SAVER_LABEL" "$SAVER_INTERVAL_SEC" "$PT_ROOT/libexec/power-saver.sh" "tick")
   reload_agent "$SAVER_LABEL" "$p"; c_green "  agent  $SAVER_LABEL (every ${SAVER_INTERVAL_SEC}s)"
-  p=$(gen_plist "$MEM_WATCHDOG_LABEL" "$MEM_WATCHDOG_INTERVAL_SEC" "$PT_ROOT/libexec/mem-watchdog.sh")
-  reload_agent "$MEM_WATCHDOG_LABEL" "$p"
-  (( MEM_OBSERVE )) && c_green "  agent  $MEM_WATCHDOG_LABEL (every ${MEM_WATCHDOG_INTERVAL_SEC}s, OBSERVE — no kills)" \
-                    || c_green "  agent  $MEM_WATCHDOG_LABEL (every ${MEM_WATCHDOG_INTERVAL_SEC}s)"
+  if (( STORAGE_ENABLE )); then
+    c_green "  agent  $MEM_WATCHDOG_LABEL (storage runner; memory every ${MEM_WATCHDOG_INTERVAL_SEC}s)"
+    c_green "  agent  $STORAGE_DAILY_LABEL (daily storage report)"
+  else
+    c_green "  agent  $MEM_WATCHDOG_LABEL (stock, every ${MEM_WATCHDOG_INTERVAL_SEC}s)"
+    c_green "  agent  $STORAGE_DAILY_LABEL (disabled, no login schedule)"
+  fi
 
   if [[ -n "$SLEEPWATCHER" ]]; then
     p=$(gen_plist "$SLEEPWATCHER_LABEL" 0 "$SLEEPWATCHER" "-s" "$PT_ROOT/libexec/on-sleep" "-w" "$PT_ROOT/libexec/on-wake")
@@ -142,12 +184,12 @@ cmd_install() {
     rm -f "$HOME/bin/cpu-watchdog.sh"
     c_dim "  migrated old standalone watchdog"
   fi
-  cmd_apply
+  cmd_apply || return $?
   print; print -- "Add ~/bin to PATH if needed, then: pm status"
 }
 
 cmd_uninstall() {
-  for l in "$WATCHDOG_LABEL" "$SAVER_LABEL" "$SLEEPWATCHER_LABEL" "$MEM_WATCHDOG_LABEL"; do
+  for l in "$WATCHDOG_LABEL" "$SAVER_LABEL" "$SLEEPWATCHER_LABEL" "$MEM_WATCHDOG_LABEL" "$STORAGE_DAILY_LABEL"; do
     launchctl bootout "$GUI/$l" 2>/dev/null
     rm -f "$AGENTS_DIR/$l.plist"
     c_dim "  removed $l"
@@ -190,6 +232,9 @@ cmd_status() {
   print; print -- "  Agents"
   print -n  "    cpu-watchdog   "; agent_state "$WATCHDOG_LABEL"
   print -n  "    mem-watchdog   "; agent_state "$MEM_WATCHDOG_LABEL"; (( MEM_OBSERVE )) && c_dim "      (observe mode — logs would-be actions, no kills)"
+  if (( STORAGE_ENABLE )); then
+    print -n "    storage-daily  "; agent_state "$STORAGE_DAILY_LABEL"
+  fi
   print -n  "    power-saver    "; agent_state "$SAVER_LABEL"
   print -n  "    sleepwatcher   "; [[ -n "$SLEEPWATCHER" ]] && agent_state "$SLEEPWATCHER_LABEL" || c_red "not installed"
   print; print -- "  pmset (desired → actual)"
@@ -235,6 +280,10 @@ cmd_doctor() {
   chk "sleepwatcher installed"    '[[ -n "$SLEEPWATCHER" ]]'    "brew install sleepwatcher"
   chk "cpu-watchdog agent loaded" 'launchctl print "$GUI/$WATCHDOG_LABEL" >/dev/null 2>&1' "pm apply"
   chk "mem-watchdog agent loaded" 'launchctl print "$GUI/$MEM_WATCHDOG_LABEL" >/dev/null 2>&1' "pm apply"
+  if (( STORAGE_ENABLE )); then
+    chk "storage daily loaded" 'launchctl print "$GUI/$STORAGE_DAILY_LABEL" >/dev/null 2>&1' "pm apply"
+    chk "storage Python executable" '[[ -x "$STORAGE_PYTHON" ]]' "set STORAGE_PYTHON in config.sh"
+  fi
   chk "saver agent loaded"        'launchctl print "$GUI/$SAVER_LABEL" >/dev/null 2>&1'    "pm apply"
   chk "sleep/wake hooks loaded"   'launchctl print "$GUI/$SLEEPWATCHER_LABEL" >/dev/null 2>&1' "pm apply"
   chk "clamshell state readable"  'ioreg -r -k AppleClamshellState 2>/dev/null | grep -q AppleClamshellState' "macOS API changed?"

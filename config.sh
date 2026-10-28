@@ -14,6 +14,40 @@ SAVER_LABEL="$PT_LABEL_PREFIX.power-saver"
 SLEEPWATCHER_LABEL="$PT_LABEL_PREFIX.sleepwatcher"
 MEM_WATCHDOG_LABEL="$PT_LABEL_PREFIX.mem-watchdog"
 
+# ---------- storage tracking (observe only; no deletion/control path) ----------
+STORAGE_DAILY_LABEL="$PT_LABEL_PREFIX.storage-daily"
+STORAGE_ENABLE=${STORAGE_ENABLE:-1}   # 0 restores the stock periodic memory watchdog
+STORAGE_PYTHON=${STORAGE_PYTHON:-/opt/homebrew/bin/python3}
+STORAGE_STATE=${STORAGE_STATE:-$HOME/.local/state/power-toolkit-storage}
+STORAGE_INTERVAL_SEC=5
+STORAGE_FAST_FALL_BYTES=2000000000
+STORAGE_WINDOW_SEC=600
+STORAGE_CAPTURE_COOLDOWN_SEC=300
+STORAGE_ATTRIBUTION_TIMEOUT_SEC=8
+STORAGE_INCIDENT_SLOTS=40             # circular overwrite; no automatic file deletion
+STORAGE_SCAN_TIMEOUT_SEC=180
+STORAGE_DAILY_BUDGET_SEC=1800
+STORAGE_DAILY_HOUR=4
+STORAGE_DAILY_MINUTE=15
+STORAGE_DEVELOPMENT="$HOME/Development"
+STORAGE_PWE_LOCAL="$STORAGE_DEVELOPMENT/personal-work-ecosystem/local"
+# getconf resolves the current user's T/C roots; X is their sibling. No other users.
+STORAGE_USER_TEMP=$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)
+STORAGE_USER_CACHE=$(/usr/bin/getconf DARWIN_USER_CACHE_DIR 2>/dev/null || true)
+typeset -A STORAGE_ROOTS=(
+  codex-sessions "$HOME/.codex/sessions"
+  codex-db "$HOME/.codex"
+  claude-projects "$HOME/.claude/projects"
+  wispr-backups "$HOME/Library/Application Support/Wispr Flow/backups"
+  wispr-live-and-app "$HOME/Library/Application Support/Wispr Flow"
+  claude-vm "$HOME/Library/Application Support/Claude/vm_bundles"
+  claude-host-sessions "$HOME/Library/Application Support/Claude/local-agent-mode-sessions"
+  user-caches "$HOME/.cache"
+  app-caches "$HOME/Library/Caches"
+  codex-task-folders "$HOME/Documents/Codex"
+  pwe-local "$STORAGE_PWE_LOCAL"
+)
+
 # ---------- kill-safety (GOAL_CONTRACT §4) — ONE list, consumed by BOTH watchdogs ----------
 # Never SIGTERM/SIGKILL, whatever the CPU or RSS. Defined once, here, because the two watchdogs
 # previously carried SEPARATE lists and they drifted: the CPU path's `KILL_ALLOWLIST` omitted

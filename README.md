@@ -267,3 +267,20 @@ and a one-command script to apply the same gates to another repo are in
 ## License
 
 MIT — see LICENSE. Copyright 2026 Logan Rooks.
+
+## Storage tracking
+
+The owned memory LaunchAgent now runs a five-second, metadata-only storage
+sampler and dispatches the existing memory guardian at its configured cadence.
+A daily 04:15 report measures native APFS private regular-file allocation,
+including app/VM, per-user temp/cache, worktree and PWE lane growth. Alerts reuse
+the existing notifier. No automatic cleanup or process control is added.
+
+Daily briefing link: `~/.local/state/power-toolkit-storage/daily/latest.md`.
+See [scope, installation checks and rollback](docs/storage-tracking.md).
+`zsh ./install.sh --dry-run --output DIRECTORY` generates the two storage plists
+without installing anything. Normal `install.sh` and `pm apply` share the same
+storage generator, so reconciliation retains the runner. Guardian scheduling
+continues independently of telemetry writes and native capture. Storage job
+apply failures retain recovery copies; disabled rollback removes the daily
+schedule while keeping history.

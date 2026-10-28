@@ -84,6 +84,11 @@ if [[ -f "$ALERT_STATE" ]]; then
   done < "$ALERT_STATE"
 fi
 typeset -a edges=()
+# Storage runner emits only capture-backed fast edges; reuse this notifier/lock.
+if [[ "${MEM_STORAGE_FAST_FALL:-0}" == 1 ]]; then
+  edges+=("disk:fast-fall")
+  print -- "$(ts) EVENT disk:fast-fall" >> "$LOG"
+fi
 edge() {
   local key=$1 value=$2
   [[ -n "$value" ]] || return 0

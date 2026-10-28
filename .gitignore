@@ -1,2 +1,5 @@
 var/
 .DS_Store
+__pycache__/
+*.pyc
+.ruff_cache/
